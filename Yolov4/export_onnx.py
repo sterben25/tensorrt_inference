@@ -205,7 +205,8 @@ class ResizeParams(object):
     def generate_param_name(self):
         """Generates the scale parameter name for the Resize node."""
         param_name = self.node_name + '_' + "scale"
-        return param_name
+        roi_name = self.node_name + '_' + "roi"
+        return roi_name, param_name
 
 
 class ROIParams(object):
@@ -352,13 +353,17 @@ class WeightLoader(object):
         """
         initializer = list()
         inputs = list()
-        name = resize_params.generate_param_name()
+        m_roi, m_scale = resize_params.generate_param_name()
+        # add roi input
+        roi_init = helper.make_tensor(m_roi, TensorProto.FLOAT, (0,), [])
+        roi_input = helper.make_tensor_value_info(m_roi, TensorProto.FLOAT, (0,))
+        initializer.append(roi_init)
+        inputs.append(roi_input)
+        # add scale input
         shape = resize_params.value.shape
         data = resize_params.value
-        scale_init = helper.make_tensor(
-            name, TensorProto.FLOAT, shape, data)
-        scale_input = helper.make_tensor_value_info(
-            name, TensorProto.FLOAT, shape)
+        scale_init = helper.make_tensor(m_scale, TensorProto.FLOAT, shape, data)
+        scale_input = helper.make_tensor_value_info(m_scale, TensorProto.FLOAT, shape)
         initializer.append(scale_init)
         inputs.append(scale_input)
         return initializer, inputs
@@ -520,6 +525,7 @@ class GraphBuilderONNX(object):
             layer_configs,
             weights_file_path,
             neck,
+            opset_version=11,
             verbose=True):
         """Iterate over all layer configs (parsed from the DarkNet representation
         of YOLOv4-608), create an ONNX graph, populate it with weights from the weights
@@ -529,6 +535,7 @@ class GraphBuilderONNX(object):
         layer_configs -- an OrderedDict object with all parsed layers' configurations
         weights_file_path -- location of the weights file
         verbose -- toggles if the graph is printed after creation (default: True)
+        opset_version -- onnx opset version (default: 11)
         """
         for layer_name in layer_configs.keys():
             layer_dict = layer_configs[layer_name]
@@ -544,7 +551,7 @@ class GraphBuilderONNX(object):
                 grids *= i
             total_grids += grids / (self.classes + 5)
             output_dims = [self.batch_size, ] + \
-                self.output_tensors[tensor_name]
+                          self.output_tensors[tensor_name]
             layer_name, layer_dict = tensor_name, {'output_dims': output_dims}
             transpose_name = self._make_transpose_node(layer_name, layer_dict, len(self.output_tensors))
             transposes.append(transpose_name)
@@ -601,7 +608,7 @@ class GraphBuilderONNX(object):
         )
         if verbose:
             print(helper.printable_graph(self.graph_def))
-        model_def = helper.make_model(self.graph_def, opset_imports=[helper.make_opsetid("", 10)],
+        model_def = helper.make_model(self.graph_def, opset_imports=[helper.make_opsetid("", opset_version)],
                                       producer_name='darknet to ONNX example')
         return model_def
 
@@ -717,7 +724,10 @@ class GraphBuilderONNX(object):
         if not batch_normalize:
             bias_name = conv_params.generate_param_name('conv', 'bias')
             inputs.append(bias_name)
-
+        # compute the pad size
+        kernel_size = kernel_shape[0]
+        pad_size = int((kernel_size - 1) / 2)
+        pad = [pad_size, pad_size, pad_size, pad_size]
         conv_node = helper.make_node(
             'Conv',
             inputs=inputs,
@@ -725,7 +735,7 @@ class GraphBuilderONNX(object):
             kernel_shape=kernel_shape,
             strides=strides,
             group=groups,
-            auto_pad='SAME_LOWER',
+            pads=pad,
             dilations=dilations,
             name=layer_name
         )
@@ -968,12 +978,15 @@ class GraphBuilderONNX(object):
         channels = previous_node_specs.channels
         assert channels > 0
         resize_params = ResizeParams(layer_name, scales)
-        scales_name = resize_params.generate_param_name()
-        inputs.append(scales_name)
-
+        resize_para_names = resize_params.generate_param_name()
+        for name in resize_para_names:
+            inputs.append(name)
         resize_node = helper.make_node(
             'Resize',
             mode='nearest',
+            nearest_mode='floor',
+            coordinate_transformation_mode='asymmetric',
+            cubic_coeff_a=-0.75,
             inputs=inputs,
             outputs=[layer_name],
             name=layer_name,
@@ -1087,6 +1100,7 @@ def main(cfg_file='yolov4.cfg', weights_file='yolov4.weights', output_file='yolo
         layer_configs=layer_configs,
         weights_file_path=weights_file_path,
         neck=neck,
+        opset_version=11,
         verbose=True)
     # Once we have the model definition, we do not need the builder anymore:
     del builder
